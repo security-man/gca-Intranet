@@ -1,0 +1,100 @@
+# STAGE 1: Build the assets (using the logic you found)
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY wp-content/themes/gca-intranet-foundation ./theme-folder
+
+RUN set -eux; \
+    cd ./theme-folder; \
+    npm install; \
+    # We override the command here to ensure the load-path is absolute and correct
+    ./node_modules/.bin/sass \
+        assets/scss/theme.scss:assets/dist/gca-theme.css \
+        assets/scss/_landing-page.scss:assets/dist/landing-page.css \
+        assets/scss/_feature-flags-admin.scss:assets/dist/feature-flags-admin.css \
+    --style=compressed \
+    --load-path=node_modules \
+    --quiet-deps; \
+    # Run the rest of the build (copying JS)
+    npm run js:copygovuk-frontend; \
+    npm run js:minifygovuk-frontend
+
+# STAGE 2: The actual WordPress container
+FROM wordpress:6.9.4-php8.2-apache
+
+COPY docker/php.ini /usr/local/etc/php/conf.d/custom-php.ini
+
+# Remove default WordPress themes from the source directory so docker-entrypoint.sh
+# doesn't copy them into /var/www/html at container startup.
+RUN rm -rf /usr/src/wordpress/wp-content/themes/twentytwentyfive \
+           /usr/src/wordpress/wp-content/themes/twentytwentyfour \
+           /usr/src/wordpress/wp-content/themes/twentytwentythree
+
+# 1. Install system dependencies (zip for WP-CLI/GDS) and PHP Redis extension (for Redis Object Cache with TLS)
+RUN apt-get update \
+  && apt-get upgrade -y --no-install-recommends \
+  && apt-get install -y --no-install-recommends libzip-dev unzip \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/* \
+  && docker-php-ext-install zip \
+  && pecl install redis \
+  && docker-php-ext-enable redis
+
+# 2. Install WP-CLI into the image
+ARG WP_CLI_VERSION=2.12.0
+RUN curl -sSLo /usr/local/bin/wp "https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION}/wp-cli-${WP_CLI_VERSION}.phar" \
+  && chmod +x /usr/local/bin/wp \
+  && wp --info
+
+# 3. Copy the whole wp-content (contains your php files)
+COPY wp-content/ /var/www/html/wp-content/
+
+# 3a. Download Redis Object Cache plugin and install object-cache.php drop-in
+ARG REDIS_CACHE_VERSION=2.5.4
+RUN curl -sSLo /tmp/redis-cache.zip "https://downloads.wordpress.org/plugin/redis-cache.${REDIS_CACHE_VERSION}.zip" \
+  && unzip -q /tmp/redis-cache.zip -d /var/www/html/wp-content/plugins/ \
+  && cp /var/www/html/wp-content/plugins/redis-cache/includes/object-cache.php /var/www/html/wp-content/object-cache.php \
+  && rm /tmp/redis-cache.zip
+
+# 4. Pull ONLY the compiled CSS/JS from the builder stage
+# This ensures ECR gets the "ready to go" assets
+COPY --from=builder /app/theme-folder/assets/dist/ /var/www/html/wp-content/themes/gca-intranet-foundation/assets/dist/
+COPY --from=builder /app/theme-folder/assets/scripts/ /var/www/html/wp-content/themes/gca-intranet-foundation/assets/scripts/
+
+# Block execution of scripts in the uploads directory (pentest hardening)
+COPY docker/uploads-security.conf /etc/apache2/conf-enabled/uploads-security.conf
+
+# Ensure Apache listens on 8080 for ECS
+RUN sed -i 's/Listen 80/Listen 8080/' /etc/apache2/ports.conf && \
+    sed -i 's/<VirtualHost \*:80>/<VirtualHost *:8080>/' /etc/apache2/sites-available/000-default.conf
+
+# One-off init script (used by docker compose run init, and by ECS one-off init tasks)
+COPY docker/wp-init.sh /usr/local/bin/wp-init.sh
+RUN chmod +x /usr/local/bin/wp-init.sh
+
+# Add the custom WordPress config bridge
+COPY docker/wp-config-extra.php /opt/wp-config-extra.php
+
+# Health check endpoint - returns 200 directly without triggering the HTTPS
+# redirect that FORCE_SSL_ADMIN applies to all other WordPress URLs. Used by
+# both the Dockerfile HEALTHCHECK below and the ECS task definition healthcheck.
+COPY docker/health.php /var/www/html/health.php
+
+# WP-CLI global config (path + url so `wp` works without flags)
+COPY wp-cli.yml /var/www/html/wp-cli.yml
+ENV WORDPRESS_CONFIG_EXTRA="require '/opt/wp-config-extra.php';"
+
+# Add the main startup init script
+COPY docker/wordpress-init.sh /usr/local/bin/wordpress-init.sh
+RUN chmod +x /usr/local/bin/wordpress-init.sh
+
+# Tell AWS ECS how to verify the container is healthy.
+# Uses /health.php which returns HTTP 200 directly - avoids the HTTPS redirect
+# that wp-login.php triggers via FORCE_SSL_ADMIN, which curl inside the container
+# cannot follow (it resolves to an external URL). Increased start-period to give
+# WordPress time to initialise before checks begin.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
+  CMD curl -fsS http://localhost:8080/health.php >/dev/null || exit 1
+
+# Run the init script, then start Apache
+ENTRYPOINT ["wordpress-init.sh"]
+CMD ["apache2-foreground"]
